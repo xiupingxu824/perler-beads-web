@@ -1,46 +1,88 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import axios from 'axios'
 
-type Color = { code: string; name: string; hex: string; quantity: number }
-const width = ref(28), height = ref(28), maxColors = ref(16), zoom = ref(1.12)
+type Color = { id?: number; code: string; name: string; hex: string; quantity: number }
+const width = ref(60), height = ref(80), maxColors = ref(64), zoom = ref(1.12)
+const keepRatio = ref(true)
 const selected = ref('#ff6b6b'), message = ref(''), fileName = ref('尚未选择图片'), sourceImage = ref('')
+const showGrid = ref(true)
+const uploadedFileId = ref<string | null>(null)
+const uploading = ref(false)
+const generating = ref(false)
+const generateError = ref('')
 const fileInput = ref<HTMLInputElement>()
 const undoStack = ref<string[][]>([]), redoStack = ref<string[][]>([])
+const projectId = ref<number | null>(null)
+const loggedIn = ref(localStorage.getItem('perler-token') === 'demo-session')
+const loginForm = ref({ username: 'admin', password: '123456' })
+const loginError = ref('')
 const colors = ref<Color[]>([
   { code:'A01', name:'珊瑚红', hex:'#FF6B6B', quantity:126 }, { code:'A02', name:'奶油黄', hex:'#FFD166', quantity:98 },
   { code:'A03', name:'晴空蓝', hex:'#70D6FF', quantity:112 }, { code:'A04', name:'薄荷绿', hex:'#8CE99A', quantity:85 },
   { code:'A05', name:'薰衣草', hex:'#A78BFA', quantity:74 }, { code:'A06', name:'蜜桃橙', hex:'#FF9F68', quantity:63 },
   { code:'A07', name:'深灰', hex:'#34313F', quantity:119 }, { code:'A08', name:'象牙白', hex:'#FFFDF8', quantity:107 }
 ])
+const colorCatalog = ref<Color[]>([])
 const palette = colors.value.map(c => c.hex)
 const cells = ref<string[]>([])
-const total = computed(() => width.value * height.value)
-function generate() { cells.value = Array.from({length: total.value}, (_, i) => { const r = Math.floor(i / width.value), c = i % width.value; return (r > 4 && r < height.value - 5 && c > 4 && c < width.value - 5) ? palette[(r+c)%6] : '#FFFDF8' }); refreshStats(); notify('图纸已重新生成') }
+const selectedColorGroup = ref('ALL')
+const total = computed(() => cells.value.filter(Boolean).length)
+const activeColors = computed(() => colors.value.filter(c => c.quantity > 0))
+const colorGroups = computed(() => Array.from(new Set(colorCatalog.value.map(c => c.code.match(/^[A-Za-z]+/)?.[0] || 'OTHER'))).sort())
+const colorGroupCounts = computed(() => Object.fromEntries(colorGroups.value.map(group => [group, colorCatalog.value.filter(c => (c.code.match(/^[A-Za-z]+/)?.[0] || 'OTHER') === group).length])))
+const filteredColors = computed(() => selectedColorGroup.value === 'ALL' ? colorCatalog.value : colorCatalog.value.filter(c => (c.code.match(/^[A-Za-z]+/)?.[0] || 'OTHER') === selectedColorGroup.value))
+const usedColors = computed(() => colors.value.filter(c => c.quantity > 0).sort((a,b) => b.quantity - a.quantity))
+const cellCodes = computed(() => cells.value.map(hex => colors.value.find(c => c.hex.toLowerCase() === hex.toLowerCase())?.code || ''))
+function generate() { cells.value = Array.from({length: width.value * height.value}, () => ''); refreshStats() }
 function choose(color: Color) { selected.value = color.hex }
 function pick(i: number) { undoStack.value.push([...cells.value]); redoStack.value = []; cells.value[i] = selected.value; refreshStats(); notify('已修改一个拼豆颜色') }
 function notify(text: string) { message.value = text; window.setTimeout(() => message.value = '', 1800) }
+async function login() { loginError.value = ''; if (!loginForm.value.username || !loginForm.value.password) { loginError.value = '请输入账号和密码'; return } try { const res = await axios.post('/api/auth/login', loginForm.value); if (!res.data.success) { loginError.value = res.data.message || '账号或密码错误'; return } loggedIn.value = true; localStorage.setItem('perler-token', res.data.data.token); localStorage.setItem('perler-user', res.data.data.username); localStorage.setItem('perler-user-id', String(res.data.data.id)); notify('登录成功') } catch { loginError.value = '登录接口无法连接，请先启动 Spring Boot 后端' } }
+function logout() { loggedIn.value = false; localStorage.removeItem('perler-token'); notify('已退出登录') }
 function refreshStats() { const count = new Map<string, number>(); cells.value.forEach(c => count.set(c, (count.get(c) || 0) + 1)); colors.value.forEach(c => c.quantity = count.get(c.hex) || 0) }
 function undo() { const last = undoStack.value.pop(); if (last) { redoStack.value.push([...cells.value]); cells.value = last; refreshStats() } }
 function redo() { const next = redoStack.value.pop(); if (next) { undoStack.value.push([...cells.value]); cells.value = next; refreshStats() } }
-function saveProject() { localStorage.setItem('perler-project', JSON.stringify({ width: width.value, height: height.value, cells: cells.value, fileName: fileName.value })); notify('作品已保存到浏览器') }
-function loadProject() { const raw = localStorage.getItem('perler-project'); if (!raw) return notify('暂时没有保存的作品'); const data = JSON.parse(raw); width.value=data.width; height.value=data.height; cells.value=data.cells; fileName.value=data.fileName || '已保存作品'; refreshStats(); notify('已恢复上次保存的作品') }
+async function saveProject() { try { const res=await axios.post('/api/projects', { id:projectId.value, userId:Number(localStorage.getItem('perler-user-id') || 1), name:fileName.value === '尚未选择图片' ? '我的拼豆图纸' : fileName.value, width:width.value, height:height.value, brandId:1, maxColors:maxColors.value, sourceImageId:uploadedFileId.value, patternData:JSON.stringify({width:width.value,height:height.value,cells:cells.value}) }); projectId.value=res.data.data.id; notify('作品已保存到后台') } catch { notify('保存失败，请确认后端和数据库已启动') } }
+async function loadProject() { try { const res=await axios.get('/api/projects', {params:{userId:Number(localStorage.getItem('perler-user-id') || 1)}}); const data=res.data.data?.[0]; if(!data) return notify('暂时没有保存的作品'); const pattern=JSON.parse(data.patternData); projectId.value=data.id; width.value=pattern.width; height.value=pattern.height; cells.value=pattern.cells; fileName.value=data.name; refreshStats(); notify('已从后台恢复作品') } catch { notify('读取作品失败，请确认后端和数据库已启动') } }
 function download(name: string, data: Blob) { const url=URL.createObjectURL(data), a=document.createElement('a'); a.href=url; a.download=name; a.click(); URL.revokeObjectURL(url) }
-function exportJson() { download('perler-pattern.json', new Blob([JSON.stringify({width:width.value,height:height.value,cells:cells.value}, null, 2)], {type:'application/json'})); notify('JSON 图纸已导出') }
-function exportCsv() { download('perler-pattern.csv', new Blob([cells.value.slice(0,height.value).map((_,r)=>cells.value.slice(r*width.value,(r+1)*width.value).join(',')).join('\n')], {type:'text/csv;charset=utf-8'})); notify('CSV 图纸已导出') }
-function exportPng() { const canvas=document.createElement('canvas'), size=20; canvas.width=width.value*size; canvas.height=height.value*size; const ctx=canvas.getContext('2d')!; cells.value.forEach((color,i)=>{const x=(i%width.value)*size,y=Math.floor(i/width.value)*size;ctx.fillStyle=color;ctx.fillRect(x,y,size,size);ctx.strokeStyle='#d7d2df';ctx.strokeRect(x,y,size,size)}); canvas.toBlob(blob=>blob&&download('perler-pattern.png',blob),'image/png'); notify('PNG 图纸已导出') }
-function handleFile(event: Event) { const file=(event.target as HTMLInputElement).files?.[0]; if (!file) return; fileName.value=file.name; const reader=new FileReader(); reader.onload=()=>{sourceImage.value=String(reader.result); const image=new Image(); image.onload=()=>generateFromImage(image); image.src=sourceImage.value}; reader.readAsDataURL(file) }
+async function exportJson() { if(!projectId.value) await saveProject(); if(!projectId.value) return; try { const res=await axios.get(`/api/projects/${projectId.value}/export/json`, {responseType:'blob'}); download('perler-pattern.json', res.data); notify('JSON 图纸已从后台导出') } catch { notify('导出失败，请确认后端已启动') } }
+async function exportCsv() { if(!projectId.value) await saveProject(); if(!projectId.value) return; try { const res=await axios.get(`/api/projects/${projectId.value}/export/csv`, {responseType:'blob'}); download('perler-pattern.csv',res.data); notify('CSV 图纸已从后台导出') } catch { notify('导出失败，请确认后端已启动') } }
+async function exportPng() { if(!projectId.value) await saveProject(); if(!projectId.value) return; try { const res=await axios.get(`/api/projects/${projectId.value}/export/png`, {responseType:'blob'}); download('perler-pattern.png',res.data); notify('PNG 图纸已从后台导出') } catch { notify('导出失败，请确认后端已启动') } }
+async function handleFile(event: Event) { const file=(event.target as HTMLInputElement).files?.[0]; if (!file) return; uploadedFileId.value=null; sourceImage.value=''; generateError.value=''; uploading.value=true; fileName.value=file.name; const reader=new FileReader(); reader.onload=async()=>{sourceImage.value=String(reader.result); try { const form=new FormData(); form.append('file',file); const res=await axios.post('/api/files/upload',form); uploadedFileId.value=res.data.data.fileId; notify(`最新图片已上传，后台 fileId=${uploadedFileId.value}`) } catch { notify('图片上传失败'); } finally { uploading.value=false } }; reader.readAsDataURL(file) }
 function generateFromImage(image: HTMLImageElement) { const canvas=document.createElement('canvas'); canvas.width=width.value; canvas.height=height.value; const ctx=canvas.getContext('2d')!; ctx.drawImage(image,0,0,width.value,height.value); const pixels=ctx.getImageData(0,0,width.value,height.value).data; const result:string[]=[]; for(let i=0;i<width.value*height.value;i++){const r=pixels[i*4],g=pixels[i*4+1],b=pixels[i*4+2]; let best=palette[0],distance=Infinity; palette.forEach(color=>{const n=parseInt(color.slice(1),16),cr=n>>16,cg=(n>>8)&255,cb=n&255,d=(r-cr)**2+(g-cg)**2+(b-cb)**2;if(d<distance){distance=d;best=color}});result.push(best)}; undoStack.value.push([...cells.value]); cells.value=result; refreshStats(); notify('图片已转换为拼豆图纸') }
-async function generateFromApi() { if (sourceImage.value) { const image=new Image(); image.onload=()=>generateFromImage(image); image.src=sourceImage.value; return } try { const res = await axios.post('/api/pattern/generate', { width: width.value, height: height.value, maxColors: maxColors.value }); if (res.data.success) { cells.value = res.data.data.matrix.flat().map((code: string) => colors.value.find(c => c.code === code)?.hex || '#FFFDF8'); refreshStats(); notify('已从后端生成图纸') } } catch { generate(); notify('后端未启动，已使用本地预览数据') } }
+async function generateFromApi() { generateError.value=''; if (uploading.value) { generateError.value='图片仍在上传，请稍候'; return } if (!uploadedFileId.value) { generateError.value='请先选择并完成图片上传'; return } generating.value=true; try { const res = await axios.post('/api/pattern/generate', { width: width.value, height: height.value, maxColors: maxColors.value, brandId:1, keepRatio:keepRatio.value, dithering:false, fileId:uploadedFileId.value, imageBase64:null }); if (!res.data.success) throw new Error(res.data.message || '后台生成失败'); const result=res.data.data; colors.value=result.colors.map((c:Color)=>({...c})); if (!colorCatalog.value.length) colorCatalog.value=result.colors.map((c:Color)=>({...c,quantity:0})); cells.value = result.matrix.flat().map((code: string) => colors.value.find(c => c.code === code)?.hex || '#FFFDF8'); refreshStats(); notify(`识别完成，需要 ${colors.value.filter(c => c.quantity > 0).length} 种颜色，共 ${result.totalBeads} 颗拼豆`) } catch (error: any) { generateError.value=error?.response?.data?.message || error?.message || '生成失败，请检查后端日志'; } finally { generating.value=false } }
+async function loadColors() { try { const res=await axios.get('/api/colors', {params:{brandId:1}}); if(res.data.success && res.data.data.length) { const loaded=res.data.data.map((c:Color)=>({...c,quantity:0})); colors.value=loaded; colorCatalog.value=loaded.map(c=>({...c})); } } catch { notify('颜色库读取失败，请确认数据库已初始化') } }
+onMounted(loadColors)
 generate()
 </script>
 
 <template>
-  <header class="topbar"><div class="brand"><b>◆</b> PERLER BEADS</div><nav><span class="active">制作图纸</span><span @click="loadProject">我的作品</span><span>颜色库</span><span>灵感社区</span></nav><div class="user">帮助中心 <i>林</i></div></header>
-  <section class="hero"><div><small>PERLER PATTERN STUDIO</small><h1>把喜欢的图片，变成拼豆图纸</h1><p>上传图片，调整颜色与尺寸，开始你的下一件手作。</p></div><div><button class="light" @click="saveProject">⌘ 保存作品</button><button class="primary" @click="exportPng">↓ 导出 PNG</button></div></section>
+  <section v-if="!loggedIn" class="login-page">
+    <div class="login-decoration"><div class="floating-bead bead-a"></div><div class="floating-bead bead-b"></div><div class="floating-bead bead-c"></div><div class="mini-grid"><i v-for="n in 36" :key="n"></i></div></div>
+    <div class="login-card"><img class="login-banner" src="/login-brand-banner.png?v=1" alt="豆想玩品牌横幅"><h1>欢迎回来</h1><p>登录后继续制作你的拼豆图纸</p><form @submit.prevent="login"><label>账号<input v-model="loginForm.username" placeholder="请输入账号"></label><label>密码<input v-model="loginForm.password" type="password" placeholder="请输入密码"></label><div v-if="loginError" class="login-error">{{ loginError }}</div><button class="primary login-submit" type="submit">登录</button></form><div class="login-hint">演示账号：admin　密码：123456</div><div class="login-footer">还没有账号？<span @click="notify('注册功能将在下一版接入')">立即注册</span></div></div>
+  </section>
+  <template v-else>
+  <header class="topbar">
+    <div class="brand brand-logo">
+      <img src="/perler-brand-logo-tight.png?v=3" alt="豆想玩品牌标识">
+    </div>
+    <nav>
+      <span class="active">制作图纸</span>
+      <span @click="loadProject">我的作品（暂未开放）</span>
+    </nav>
+    <div class="user" @click="logout">
+      退出登录<div v-if="message" class="toast">{{ message }}</div>
+      <i>许</i>
+    </div>
+  </header>
+  <section class="hero"><div><h1>把喜欢的图片，变成拼豆图纸</h1></div></section>
   <main class="workspace">
-    <aside class="panel settings"><h3>图纸设置 <em>STEP 1 / 3</em></h3><div class="upload"><div class="upload-icon">↥</div><strong>{{ fileName }}</strong><span>支持 JPG、PNG，最大 10MB</span><button class="light" @click="fileInput?.click()">选择图片</button><input ref="fileInput" type="file" accept="image/png,image/jpeg" hidden @change="handleFile"></div><label>图纸尺寸 <small>建议 20–80 格</small><div class="row"><input v-model.number="width" type="number" min="4" max="80"><b>×</b><input v-model.number="height" type="number" min="4" max="80"></div></label><label>颜色数量 <small>{{ maxColors }} 色</small><input v-model.number="maxColors" type="range" min="4" max="32"></label><label>颜色品牌<select><option>豆趣标准色库</option><option>Perler</option><option>Hama</option></select></label><p class="check"><input type="checkbox" checked> 保持图片比例</p><p class="check"><input type="checkbox"> 开启颜色抖动</p><p class="check"><input type="checkbox" checked> 显示网格线</p><button class="generate" @click="generateFromApi">✦ 生成拼豆图纸</button></aside>
-    <section class="editor"><div class="editor-head"><b>图纸编辑器</b><div><button class="tool" @click="undo">↶</button><button class="tool" @click="redo">↷</button><button class="tool active">▦</button><button class="tool" @click="exportJson">JSON</button><button class="tool" @click="exportCsv">CSV</button></div></div><div class="stage"><div class="grid" :style="{gridTemplateColumns:`repeat(${width}, 16px)`, transform:`scale(${zoom})`}"><button v-for="(cell,i) in cells" :key="i" class="cell" :style="{background:cell}" @click="pick(i)"></button></div></div><footer>点击网格可修改颜色 · 当前工具：画笔 <span><button class="tool" @click="zoom=Math.max(.7,zoom-.1)">−</button>{{ Math.round(zoom*100) }}%<button class="tool" @click="zoom=Math.min(1.8,zoom+.1)">＋</button></span></footer></section>
-    <aside class="panel stats"><h3>作品信息 <em>实时统计</em></h3><div class="summary"><div><small>总拼豆数</small><strong>{{ total }}</strong></div><div><small>颜色种类</small><strong>{{ colors.filter(c => c.quantity > 0).length }}</strong></div><div><small>图纸尺寸</small><strong>{{ width }}×{{ height }}</strong></div><div><small>预估成本</small><strong>¥{{ (total * 0.016).toFixed(1) }}</strong></div></div><h3>颜色清单 <em>数量</em></h3><div v-for="color in colors" :key="color.code" class="color" @click="choose(color)"><i :style="{background:color.hex}"></i><span class="code">{{ color.code }}</span><span>{{ color.name }}</span><b :style="{width: Math.min(100, color.quantity / Math.max(1,total) * 1000) + '%', background: color.hex}"></b><small>{{ color.quantity }}</small></div><div class="tip">小提示：点击颜色后，再点击网格可以修改单颗拼豆。作品保存到浏览器后，下次可以直接恢复。</div></aside>
-  </main><div v-if="message" class="toast">{{ message }}</div>
+    <aside class="panel settings"><h3>上传图纸 </h3><div class="upload" role="button" tabindex="0" @click="fileInput?.click()"><div class="upload-icon">↥</div><strong>{{ fileName }}</strong><span>支持 JPG、PNG，最大 10MB</span><input ref="fileInput" type="file" accept="image/png,image/jpeg" hidden @click.stop @change="handleFile"></div><label>图纸尺寸 <small>建议 20–120 格</small><div class="row"><input v-model.number="width" type="number" min="4" max="120"><b>×</b><input v-model.number="height" type="number" min="4" max="120"></div></label>
+      <p class="check"><input v-model="showGrid" type="checkbox"> 显示网格线</p>
+      <button class="generate" :disabled="generating || uploading" @click="generateFromApi">{{ uploading ? '图片上传中…' : (generating ? '生成中，请稍候…' : '✦ 生成拼豆图纸') }}</button><p v-if="generateError" class="generate-error">{{ generateError }}</p></aside>
+    <section class="editor"><div class="editor-head"><b>图纸编辑器</b><div class="editor-tools"><span class="zoom-tools"><button class="tool" @click="zoom=Math.max(.3,zoom-.1)">−</button><em>{{ Math.round(zoom*100) }}%</em><button class="tool" @click="zoom=Math.min(1.8,zoom+.1)">＋</button></span><button class="tool" @click="undo">↶</button><button class="tool" @click="redo">↷</button><button class="tool export-tool" @click="exportPng">↓ 导出 PNG</button></div></div><div class="stage"><div class="pattern-sheet" :style="{transform:`scale(${zoom})`}"><div></div><div class="axis top-axis"><span v-for="n in width" :key="`top-${n}`">{{ n }}</span></div><div></div><div class="axis side-axis"><span v-for="n in height" :key="`left-${n}`">{{ n }}</span></div><div class="code-grid" :class="{'grid-lines': showGrid}" :style="{gridTemplateColumns:`repeat(${width}, 22px)`}"><button v-for="(cell,i) in cells" :key="i" class="code-cell" :style="{background:cell || '#FFFDF8'}" @click="pick(i)"><span>{{ cellCodes[i] }}</span></button></div><div class="axis side-axis"><span v-for="n in height" :key="`right-${n}`">{{ n }}</span></div><div></div><div class="axis top-axis"><span v-for="n in width" :key="`bottom-${n}`">{{ n }}</span></div><div></div></div></div><section class="pattern-materials"><div class="materials-head"><div><b>本张图纸颜色清单</b><small>{{ usedColors.length }} 种颜色 · 共 {{ total }} 颗</small></div></div><div v-if="usedColors.length" class="materials-grid"><div v-for="color in usedColors" :key="color.code" class="material-item"><i :style="{background:color.hex}"></i><div><strong>{{ color.code }}</strong></div><b>x{{ color.quantity }}</b></div></div><div v-else class="materials-empty">生成图纸后，这里会显示每种颜色的编码和使用数量</div></section></section>
+    <aside class="panel stats"><h3>图纸信息 <em>实时统计</em></h3><div class="summary"><div><small>总拼豆数</small><strong>{{ total }}</strong></div><div><small>颜色种类</small><strong>{{ colors.filter(c => c.quantity > 0).length }}</strong></div><div><small>图纸尺寸</small><strong>{{ width }}×{{ height }}</strong></div><div></div></div><div class="color-title"><h3>颜色清单</h3><select v-model="selectedColorGroup" class="group-select"><option value="ALL">全部颜色 · {{ colorCatalog.length }} 色</option><option v-for="group in colorGroups" :key="group" :value="group">{{ group }} 系列 · {{ colorGroupCounts[group] }} 色</option></select></div><div class="color-list"><div v-for="color in filteredColors" :key="color.code" class="color" @click="choose(color)"><span class="code">{{ color.code }}</span><b :style="{width: '100%', background: color.hex}"></b></div></div><div class="tip">小提示：颜色编号前缀会自动分组，例如 A1、A2、A3 会归入 A 系列。点击颜色后，再点击网格可以修改单颗拼豆。</div></aside>
+  </main>
+  </template>
 </template>
