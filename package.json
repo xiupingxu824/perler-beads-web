@@ -1,0 +1,9 @@
+{
+  "name": "perler-beads-web",
+  "private": true,
+  "version": "0.0.1",
+  "type": "module",
+  "scripts": { "dev": "vite", "build": "vue-tsc -b && vite build", "preview": "vite preview" },
+  "dependencies": { "@vitejs/plugin-vue": "latest", "@vue/tsconfig": "latest", "axios": "latest", "vite": "latest", "vue": "latest", "typescript": "latest", "vue-tsc": "latest" },
+  "devDependencies": {}
+}
