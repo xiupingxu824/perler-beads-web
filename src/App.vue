@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, nextTick, onMounted, ref, watch } from 'vue'
 import axios from 'axios'
 
 type Color = { id?: number; code: string; name: string; hex: string; quantity: number }
@@ -12,9 +12,11 @@ const uploading = ref(false)
 const generating = ref(false)
 const generateError = ref('')
 const fileInput = ref<HTMLInputElement>()
+const patternCanvas = ref<HTMLCanvasElement>()
 const undoStack = ref<string[][]>([]), redoStack = ref<string[][]>([])
-const projectId = ref<number | null>(null)
-const loggedIn = ref(localStorage.getItem('perler-token') === 'demo-session')
+const projectId = ref<string | null>(null)
+function tokenIsValid() { try { const token=localStorage.getItem('perler-token'); if(!token) return false; const payload=JSON.parse(atob(token.split('.')[1].replace(/-/g,'+').replace(/_/g,'/'))); return Number(payload.exp) * 1000 > Date.now() } catch { return false } }
+const loggedIn = ref(tokenIsValid())
 const loginForm = ref({ username: 'admin', password: '123456' })
 const loginError = ref('')
 const colors = ref<Color[]>([
@@ -34,26 +36,50 @@ const colorGroupCounts = computed(() => Object.fromEntries(colorGroups.value.map
 const filteredColors = computed(() => selectedColorGroup.value === 'ALL' ? colorCatalog.value : colorCatalog.value.filter(c => (c.code.match(/^[A-Za-z]+/)?.[0] || 'OTHER') === selectedColorGroup.value))
 const usedColors = computed(() => colors.value.filter(c => c.quantity > 0).sort((a,b) => b.quantity - a.quantity))
 const cellCodes = computed(() => cells.value.map(hex => colors.value.find(c => c.hex.toLowerCase() === hex.toLowerCase())?.code || ''))
+const canvasCellSize = 22, canvasLabelSize = 42
+const canvasWidth = computed(() => width.value * canvasCellSize + canvasLabelSize * 2)
+const canvasHeight = computed(() => height.value * canvasCellSize + canvasLabelSize * 2)
 function generate() { cells.value = Array.from({length: width.value * height.value}, () => ''); refreshStats() }
 function choose(color: Color) { selected.value = color.hex }
 function pick(i: number) { undoStack.value.push([...cells.value]); redoStack.value = []; cells.value[i] = selected.value; refreshStats(); notify('已修改一个拼豆颜色') }
+function drawPattern() {
+  const canvas = patternCanvas.value; if (!canvas) return
+  const dpr = window.devicePixelRatio || 1, w = canvasWidth.value, h = canvasHeight.value
+  canvas.width = Math.round(w * dpr); canvas.height = Math.round(h * dpr); canvas.style.width = `${w}px`; canvas.style.height = `${h}px`
+  const ctx = canvas.getContext('2d'); if (!ctx) return
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0); ctx.clearRect(0, 0, w, h); ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, w, h)
+  ctx.font = '700 11px Arial, sans-serif'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.fillStyle = '#111'
+  for (let c=0;c<width.value;c++) { const x=canvasLabelSize+c*canvasCellSize+canvasCellSize/2; ctx.fillText(String(c+1),x,canvasLabelSize/2); ctx.fillText(String(c+1),x,h-canvasLabelSize/2) }
+  for (let r=0;r<height.value;r++) { const y=canvasLabelSize+r*canvasCellSize+canvasCellSize/2; ctx.fillText(String(r+1),canvasLabelSize/2,y); ctx.fillText(String(r+1),w-canvasLabelSize/2,y) }
+  const showCodes = zoom.value >= .6
+  for (let r=0;r<height.value;r++) for (let c=0;c<width.value;c++) {
+    const i=r*width.value+c, x=canvasLabelSize+c*canvasCellSize, y=canvasLabelSize+r*canvasCellSize, hex=cells.value[i] || '#FFFDF8'
+    ctx.fillStyle=hex; ctx.fillRect(x,y,canvasCellSize,canvasCellSize)
+    if (showGrid) { ctx.strokeStyle='#8d8d8d'; ctx.lineWidth=1; ctx.strokeRect(x+.5,y+.5,canvasCellSize-1,canvasCellSize-1) }
+    const code=cellCodes.value[i]; if (showCodes && code) { const n=parseInt(hex.slice(1),16), lum=(((n>>16)&255)*299+(((n>>8)&255))*587+(n&255)*114)/1000; ctx.fillStyle=lum<145?'#fff':'#333'; ctx.font='700 9px Arial, sans-serif'; ctx.fillText(code,x+canvasCellSize/2,y+canvasCellSize/2) }
+  }
+  ctx.strokeStyle='#333'; ctx.lineWidth=2; ctx.strokeRect(canvasLabelSize,canvasLabelSize,width.value*canvasCellSize,height.value*canvasCellSize)
+}
+function pickCanvas(event: MouseEvent) { const canvas=patternCanvas.value; if(!canvas) return; const rect=canvas.getBoundingClientRect(); const x=(event.clientX-rect.left)/zoom.value-canvasLabelSize, y=(event.clientY-rect.top)/zoom.value-canvasLabelSize; const col=Math.floor(x/canvasCellSize), row=Math.floor(y/canvasCellSize); if(col>=0&&col<width.value&&row>=0&&row<height.value) pick(row*width.value+col) }
 function notify(text: string) { message.value = text; window.setTimeout(() => message.value = '', 1800) }
-async function login() { loginError.value = ''; if (!loginForm.value.username || !loginForm.value.password) { loginError.value = '请输入账号和密码'; return } try { const res = await axios.post('/api/auth/login', loginForm.value); if (!res.data.success) { loginError.value = res.data.message || '账号或密码错误'; return } loggedIn.value = true; localStorage.setItem('perler-token', res.data.data.token); localStorage.setItem('perler-user', res.data.data.username); localStorage.setItem('perler-user-id', String(res.data.data.id)); notify('登录成功') } catch { loginError.value = '登录接口无法连接，请先启动 Spring Boot 后端' } }
-function logout() { loggedIn.value = false; localStorage.removeItem('perler-token'); notify('已退出登录') }
+async function login() { loginError.value = ''; if (!loginForm.value.username || !loginForm.value.password) { loginError.value = '请输入账号和密码'; return } try { const res = await axios.post('/api/auth/login', loginForm.value); if (!res.data.success) { loginError.value = res.data.message || '账号或密码错误'; return } localStorage.setItem('perler-token', res.data.data.token); localStorage.setItem('perler-user', res.data.data.username); localStorage.setItem('perler-user-id', String(res.data.data.id)); loggedIn.value = true; await loadColors(); await nextTick(); drawPattern(); notify('登录成功') } catch { loginError.value = '账号或密码错误，或登录接口无法连接' } }
+function logout() { loggedIn.value = false; localStorage.removeItem('perler-token'); localStorage.removeItem('perler-user'); localStorage.removeItem('perler-user-id'); notify('已退出登录') }
+function handleAuthExpired() { loggedIn.value = false; uploadedFileId.value = null; generateError.value = '登录已过期，请重新登录'; }
 function refreshStats() { const count = new Map<string, number>(); cells.value.forEach(c => count.set(c, (count.get(c) || 0) + 1)); colors.value.forEach(c => c.quantity = count.get(c.hex) || 0) }
 function undo() { const last = undoStack.value.pop(); if (last) { redoStack.value.push([...cells.value]); cells.value = last; refreshStats() } }
 function redo() { const next = redoStack.value.pop(); if (next) { undoStack.value.push([...cells.value]); cells.value = next; refreshStats() } }
-async function saveProject() { try { const res=await axios.post('/api/projects', { id:projectId.value, userId:Number(localStorage.getItem('perler-user-id') || 1), name:fileName.value === '尚未选择图片' ? '我的拼豆图纸' : fileName.value, width:width.value, height:height.value, brandId:1, maxColors:maxColors.value, sourceImageId:uploadedFileId.value, patternData:JSON.stringify({width:width.value,height:height.value,cells:cells.value}) }); projectId.value=res.data.data.id; notify('作品已保存到后台') } catch { notify('保存失败，请确认后端和数据库已启动') } }
+async function saveProject() { try { const res=await axios.post('/api/projects', { id:projectId.value, userId:Number(localStorage.getItem('perler-user-id') || 1), name:fileName.value === '尚未选择图片' ? '我的拼豆图纸' : fileName.value, width:width.value, height:height.value, brandId:1, maxColors:maxColors.value, sourceImageId:uploadedFileId.value, patternData:JSON.stringify({width:width.value,height:height.value,cells:cells.value,codes:cellCodes.value}) }); projectId.value=res.data.data.id; notify('作品已保存到后台') } catch { notify('保存失败，请确认后端和数据库已启动') } }
 async function loadProject() { try { const res=await axios.get('/api/projects', {params:{userId:Number(localStorage.getItem('perler-user-id') || 1)}}); const data=res.data.data?.[0]; if(!data) return notify('暂时没有保存的作品'); const pattern=JSON.parse(data.patternData); projectId.value=data.id; width.value=pattern.width; height.value=pattern.height; cells.value=pattern.cells; fileName.value=data.name; refreshStats(); notify('已从后台恢复作品') } catch { notify('读取作品失败，请确认后端和数据库已启动') } }
 function download(name: string, data: Blob) { const url=URL.createObjectURL(data), a=document.createElement('a'); a.href=url; a.download=name; a.click(); URL.revokeObjectURL(url) }
 async function exportJson() { if(!projectId.value) await saveProject(); if(!projectId.value) return; try { const res=await axios.get(`/api/projects/${projectId.value}/export/json`, {responseType:'blob'}); download('perler-pattern.json', res.data); notify('JSON 图纸已从后台导出') } catch { notify('导出失败，请确认后端已启动') } }
 async function exportCsv() { if(!projectId.value) await saveProject(); if(!projectId.value) return; try { const res=await axios.get(`/api/projects/${projectId.value}/export/csv`, {responseType:'blob'}); download('perler-pattern.csv',res.data); notify('CSV 图纸已从后台导出') } catch { notify('导出失败，请确认后端已启动') } }
 async function exportPng() { if(!projectId.value) await saveProject(); if(!projectId.value) return; try { const res=await axios.get(`/api/projects/${projectId.value}/export/png`, {responseType:'blob'}); download('perler-pattern.png',res.data); notify('PNG 图纸已从后台导出') } catch { notify('导出失败，请确认后端已启动') } }
-async function handleFile(event: Event) { const file=(event.target as HTMLInputElement).files?.[0]; if (!file) return; uploadedFileId.value=null; sourceImage.value=''; generateError.value=''; uploading.value=true; fileName.value=file.name; const reader=new FileReader(); reader.onload=async()=>{sourceImage.value=String(reader.result); try { const form=new FormData(); form.append('file',file); const res=await axios.post('/api/files/upload',form); uploadedFileId.value=res.data.data.fileId; notify(`最新图片已上传，后台 fileId=${uploadedFileId.value}`) } catch { notify('图片上传失败'); } finally { uploading.value=false } }; reader.readAsDataURL(file) }
+async function handleFile(event: Event) { const file=(event.target as HTMLInputElement).files?.[0]; if (!file) return; projectId.value=null; uploadedFileId.value=null; sourceImage.value=''; generateError.value=''; uploading.value=true; fileName.value=file.name; const reader=new FileReader(); reader.onload=async()=>{sourceImage.value=String(reader.result); try { const form=new FormData(); form.append('file',file); const res=await axios.post('/api/files/upload',form); uploadedFileId.value=res.data.data.fileId; notify(`最新图片已上传，后台 fileId=${uploadedFileId.value}`) } catch { notify('图片上传失败'); } finally { uploading.value=false } }; reader.readAsDataURL(file) }
 function generateFromImage(image: HTMLImageElement) { const canvas=document.createElement('canvas'); canvas.width=width.value; canvas.height=height.value; const ctx=canvas.getContext('2d')!; ctx.drawImage(image,0,0,width.value,height.value); const pixels=ctx.getImageData(0,0,width.value,height.value).data; const result:string[]=[]; for(let i=0;i<width.value*height.value;i++){const r=pixels[i*4],g=pixels[i*4+1],b=pixels[i*4+2]; let best=palette[0],distance=Infinity; palette.forEach(color=>{const n=parseInt(color.slice(1),16),cr=n>>16,cg=(n>>8)&255,cb=n&255,d=(r-cr)**2+(g-cg)**2+(b-cb)**2;if(d<distance){distance=d;best=color}});result.push(best)}; undoStack.value.push([...cells.value]); cells.value=result; refreshStats(); notify('图片已转换为拼豆图纸') }
-async function generateFromApi() { generateError.value=''; if (uploading.value) { generateError.value='图片仍在上传，请稍候'; return } if (!uploadedFileId.value) { generateError.value='请先选择并完成图片上传'; return } generating.value=true; try { const res = await axios.post('/api/pattern/generate', { width: width.value, height: height.value, maxColors: maxColors.value, brandId:1, keepRatio:keepRatio.value, dithering:false, fileId:uploadedFileId.value, imageBase64:null }); if (!res.data.success) throw new Error(res.data.message || '后台生成失败'); const result=res.data.data; colors.value=result.colors.map((c:Color)=>({...c})); if (!colorCatalog.value.length) colorCatalog.value=result.colors.map((c:Color)=>({...c,quantity:0})); cells.value = result.matrix.flat().map((code: string) => colors.value.find(c => c.code === code)?.hex || '#FFFDF8'); refreshStats(); notify(`识别完成，需要 ${colors.value.filter(c => c.quantity > 0).length} 种颜色，共 ${result.totalBeads} 颗拼豆`) } catch (error: any) { generateError.value=error?.response?.data?.message || error?.message || '生成失败，请检查后端日志'; } finally { generating.value=false } }
-async function loadColors() { try { const res=await axios.get('/api/colors', {params:{brandId:1}}); if(res.data.success && res.data.data.length) { const loaded=res.data.data.map((c:Color)=>({...c,quantity:0})); colors.value=loaded; colorCatalog.value=loaded.map(c=>({...c})); } } catch { notify('颜色库读取失败，请确认数据库已初始化') } }
-onMounted(loadColors)
+async function generateFromApi() { generateError.value=''; if (uploading.value) { generateError.value='图片仍在上传，请稍候'; return } if (!uploadedFileId.value) { generateError.value='请先选择并完成图片上传'; return } generating.value=true; try { const res = await axios.post('/api/pattern/generate', { width: width.value, height: height.value, maxColors: maxColors.value, brandId:1, keepRatio:keepRatio.value, dithering:false, fileId:uploadedFileId.value, imageBase64:null }); if (!res.data.success) throw new Error(res.data.message || '后台生成失败'); const result=res.data.data; projectId.value=null; colors.value=result.colors.map((c:Color)=>({...c})); if (!colorCatalog.value.length) colorCatalog.value=result.colors.map((c:Color)=>({...c,quantity:0})); cells.value = result.matrix.flat().map((code: string) => colors.value.find(c => c.code === code)?.hex || '#FFFDF8'); refreshStats(); notify(`识别完成，需要 ${colors.value.filter(c => c.quantity > 0).length} 种颜色，共 ${result.totalBeads} 颗拼豆`) } catch (error: any) { generateError.value=error?.response?.data?.message || error?.message || '生成失败，请检查后端日志'; } finally { generating.value=false } }
+async function loadColors() { try { const res=await axios.get('/api/colors', {params:{brandId:1}}); if(res.data.success && res.data.data.length) { const loaded=res.data.data.map((c:Color)=>({...c,quantity:0})); colors.value=loaded; colorCatalog.value = loaded.map((c: Color) => ({ ...c }));} } catch { notify('颜色库读取失败，请确认数据库已初始化') } }
+onMounted(() => { window.addEventListener('auth-expired', handleAuthExpired); if (loggedIn.value) loadColors() })
+watch([cells, width, height, zoom, showGrid, colors], drawPattern, { deep: true })
 generate()
 </script>
 
